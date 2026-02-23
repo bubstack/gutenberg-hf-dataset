@@ -86,3 +86,23 @@ class TestDeduplicateCatalog:
         catalog = [{"id": "1", "title": "Test", "author": "Author", "release_date": "2000-01-01"}]
         result, removed = deduplicate_catalog(catalog)
         assert len(result) == 1
+
+    def test_handles_csv_field_names(self):
+        """CSV catalog uses Title/Authors/Issued instead of title/author/release_date."""
+        catalog = [
+            {"id": "1", "Title": "Moby Dick", "Authors": "Melville, Herman", "Issued": "1995-01-01"},
+            {"id": "2", "Title": "Moby Dick; Or, The Whale", "Authors": "Melville, Herman", "Issued": "2001-07-01"},
+        ]
+        result, removed = deduplicate_catalog(catalog)
+        assert len(result) == 1
+        assert result[0]["id"] == "2"
+
+    def test_csv_split_volumes(self):
+        """CSV field names with split volume detection."""
+        catalog = [
+            {"id": "74", "Title": "The Adventures of Tom Sawyer, Complete", "Authors": "Twain, Mark", "Issued": "2006-01-01"},
+            {"id": "7193", "Title": "The Adventures of Tom Sawyer, Part 1", "Authors": "Twain, Mark", "Issued": "2004-01-01"},
+        ]
+        result, removed = deduplicate_catalog(catalog)
+        assert len(result) == 1
+        assert result[0]["id"] == "74"

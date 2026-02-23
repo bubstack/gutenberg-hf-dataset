@@ -47,8 +47,26 @@ def is_split_volume(title: str) -> bool:
     return False
 
 
+def _get_title(entry: dict) -> str:
+    """Get title from entry, handling both RDF and CSV field names."""
+    return entry.get("title", "") or entry.get("Title", "")
+
+
+def _get_author(entry: dict) -> str:
+    """Get author from entry, handling both RDF and CSV field names."""
+    return entry.get("author", "") or entry.get("Authors", "")
+
+
+def _get_date(entry: dict) -> str:
+    """Get release date from entry, handling both RDF and CSV field names."""
+    return entry.get("release_date", "") or entry.get("Issued", "")
+
+
 def deduplicate_catalog(catalog: list[dict]) -> tuple[list[dict], list[dict]]:
     """Deduplicate a catalog of book metadata.
+
+    Handles both RDF-parsed metadata (lowercase keys: title, author, release_date)
+    and CSV catalog entries (capitalized keys: Title, Authors, Issued).
 
     Returns:
         (kept, removed) - two lists of catalog entries.
@@ -60,8 +78,8 @@ def deduplicate_catalog(catalog: list[dict]) -> tuple[list[dict], list[dict]]:
     groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for entry in catalog:
         key = (
-            normalize_author(entry.get("author", "")),
-            normalize_title(entry.get("title", "")),
+            normalize_author(_get_author(entry)),
+            normalize_title(_get_title(entry)),
         )
         groups[key].append(entry)
 
@@ -76,11 +94,11 @@ def deduplicate_catalog(catalog: list[dict]) -> tuple[list[dict], list[dict]]:
         # Separate into split volumes vs. complete/normal editions
         split_entries = [
             e for e in entries
-            if is_split_volume(e.get("title", ""))
+            if is_split_volume(_get_title(e))
         ]
         non_split_entries = [
             e for e in entries
-            if not is_split_volume(e.get("title", ""))
+            if not is_split_volume(_get_title(e))
         ]
 
         # If all entries are split volumes with no complete/normal edition,
@@ -98,8 +116,8 @@ def deduplicate_catalog(catalog: list[dict]) -> tuple[list[dict], list[dict]]:
             kept.extend(entries)
             continue
 
-        # Among remaining duplicates, prefer most recent release_date
-        entries.sort(key=lambda e: e.get("release_date", ""), reverse=True)
+        # Among remaining duplicates, prefer most recent release date
+        entries.sort(key=lambda e: _get_date(e), reverse=True)
         kept.append(entries[0])
         removed.extend(entries[1:])
 
