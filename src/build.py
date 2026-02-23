@@ -92,23 +92,31 @@ def full_build(repo_id: str, data_dir: Path, dedup: bool = True) -> None:
     with tarfile.open(rdf_archive, "r:bz2") as tar:
         tar.extractall(path=rdf_dir, filter="data")
 
-    # 3. Extract text files
+    # 3. Extract text files (zip contains a tar: txt-files.tar.zip -> txt-files.tar -> files)
     logger.info("Extracting text files...")
     txt_dir = raw_dir / "txt"
     txt_dir.mkdir(exist_ok=True)
-    with zipfile.ZipFile(txt_archive, "r") as zf:
-        zf.extractall(path=txt_dir)
+    inner_tar = txt_dir / "txt-files.tar"
+    if not inner_tar.exists():
+        with zipfile.ZipFile(txt_archive, "r") as zf:
+            zf.extractall(path=txt_dir)
+    with tarfile.open(inner_tar, "r") as tar:
+        tar.extractall(path=txt_dir, filter="data")
 
     # 4. Process all books
     all_book_rows = []
     all_chapter_rows = []
     all_paragraph_rows = []
     errors = []
+    total = len(catalog)
 
-    for entry in catalog:
+    for i, entry in enumerate(catalog):
         book_id = entry["id"]
         if not book_id or not book_id.isdigit():
             continue
+
+        if (i + 1) % 1000 == 0:
+            logger.info(f"Progress: {i + 1}/{total} ({len(all_book_rows)} processed, {len(errors)} errors)")
 
         try:
             rdf_path = rdf_dir / "cache" / "epub" / book_id / f"pg{book_id}.rdf"
@@ -118,15 +126,11 @@ def full_build(repo_id: str, data_dir: Path, dedup: bool = True) -> None:
 
             meta = parse_rdf(rdf_path)
 
-            # Find text file - try multiple path patterns
-            txt_path = txt_dir / f"{book_id}" / f"pg{book_id}.txt"
+            # Find text file (structure: cache/epub/{id}/pg{id}.txt)
+            txt_path = txt_dir / "cache" / "epub" / book_id / f"pg{book_id}.txt"
             if not txt_path.exists():
-                alt_paths = list(txt_dir.rglob(f"pg{book_id}.txt"))
-                if alt_paths:
-                    txt_path = alt_paths[0]
-                else:
-                    logger.warning(f"No text for book {book_id}, skipping")
-                    continue
+                logger.warning(f"No text for book {book_id}, skipping")
+                continue
 
             raw_bytes = txt_path.read_bytes()
             clean_text = strip_gutenberg_headers(raw_bytes)
