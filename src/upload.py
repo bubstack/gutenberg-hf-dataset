@@ -121,10 +121,14 @@ def upload_from_jsonl(
         shard_paths = _rename_shards(shard_paths)
         logger.info(f"  {config_name}: {len(shard_paths)} shards")
 
-    # Upload all parquet directories
-    logger.info(f"Uploading parquet files to {repo_id}...")
-    api.upload_large_folder(
-        repo_id=repo_id,
-        repo_type="dataset",
-        folder_path=str(parquet_base),
-    )
+    # Upload each config separately to avoid massive single commits
+    for config_name in configs:
+        config_dir = parquet_base / config_name
+        logger.info(f"Uploading {config_name} ({len(list(config_dir.glob('*.parquet')))} shards)...")
+        api.upload_folder(
+            repo_id=repo_id,
+            repo_type="dataset",
+            folder_path=str(config_dir),
+            path_in_repo=config_name,
+        )
+        logger.info(f"  {config_name} upload complete")
