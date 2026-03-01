@@ -1,5 +1,7 @@
+import io
 import json
 import logging
+import re
 import shutil
 import tarfile
 import zipfile
@@ -21,6 +23,9 @@ from src.dedup import deduplicate_catalog
 from src.upload import upload_dataset, upload_from_jsonl
 
 logger = logging.getLogger(__name__)
+
+# Pattern to extract book ID from tar paths like "cache/epub/12345/pg12345.txt"
+_TAR_BOOK_RE = re.compile(r"cache/epub/(\d+)/pg\1\.txt$")
 
 
 def process_book(meta: dict, text: str) -> dict:
@@ -83,6 +88,11 @@ def full_build(repo_id: str, data_dir: Path, dedup: bool = True) -> None:
         catalog, removed = deduplicate_catalog(catalog)
         logger.info(f"After dedup: {len(catalog)} entries ({len(removed)} removed)")
 
+    catalog_ids = {
+        entry["id"] for entry in catalog
+        if entry["id"] and entry["id"].isdigit()
+    }
+
     rdf_archive = raw_dir / "rdf-files.tar.bz2"
     if not rdf_archive.exists():
         logger.info("Downloading RDF metadata archive...")
@@ -97,37 +107,28 @@ def full_build(repo_id: str, data_dir: Path, dedup: bool = True) -> None:
     else:
         logger.info("Text archive already downloaded, reusing")
 
-    # 2. Extract RDF files (skip if already extracted)
+    # 2. Extract RDF files (~700MB extracted — fits in disk budget)
     rdf_dir = raw_dir / "rdf"
     rdf_dir.mkdir(exist_ok=True)
     if not (rdf_dir / "cache" / "epub").exists():
         logger.info("Extracting RDF files...")
         with tarfile.open(rdf_archive, "r:bz2") as tar:
             tar.extractall(path=rdf_dir, filter="data")
-        rdf_archive.unlink()
-        logger.info("Deleted RDF archive to free disk space")
     else:
         logger.info("RDF files already extracted, reusing")
+    rdf_archive.unlink(missing_ok=True)
 
-    # 3. Extract text files (skip if already extracted)
+    # 3. Unzip text archive to get inner tar (don't extract the tar itself)
     txt_dir = raw_dir / "txt"
     txt_dir.mkdir(exist_ok=True)
     inner_tar = txt_dir / "txt-files.tar"
-    if not (txt_dir / "cache" / "epub").exists():
-        logger.info("Extracting text files...")
-        if not inner_tar.exists():
-            with zipfile.ZipFile(txt_archive, "r") as zf:
-                zf.extractall(path=txt_dir)
-        txt_archive.unlink()
-        logger.info("Deleted text zip archive to free disk space")
-        with tarfile.open(inner_tar, "r") as tar:
-            tar.extractall(path=txt_dir, filter="data")
-        inner_tar.unlink()
-        logger.info("Deleted inner tar to free disk space")
-    else:
-        logger.info("Text files already extracted, reusing")
+    if not inner_tar.exists():
+        logger.info("Unzipping text archive...")
+        with zipfile.ZipFile(txt_archive, "r") as zf:
+            zf.extractall(path=txt_dir)
+    txt_archive.unlink(missing_ok=True)
 
-    # 4. Process all books — stream to JSONL files to avoid OOM
+    # 4. Stream text from tar — process each book without extracting to disk
     jsonl_dir = data_dir / "jsonl"
     jsonl_dir.mkdir(exist_ok=True)
     books_path = jsonl_dir / "books.jsonl"
@@ -135,22 +136,25 @@ def full_build(repo_id: str, data_dir: Path, dedup: bool = True) -> None:
     paragraphs_path = jsonl_dir / "paragraphs.jsonl"
 
     errors = []
-    total = len(catalog)
     book_count = 0
     chapter_count = 0
     paragraph_count = 0
 
+    logger.info("Streaming text from tar and processing books...")
     with open(books_path, "w") as bf, \
          open(chapters_path, "w") as cf, \
-         open(paragraphs_path, "w") as pf:
+         open(paragraphs_path, "w") as pf, \
+         tarfile.open(inner_tar, "r") as tar:
 
-        for i, entry in enumerate(catalog):
-            book_id = entry["id"]
-            if not book_id or not book_id.isdigit():
+        for member in tar:
+            if not member.isfile():
                 continue
-
-            if (i + 1) % 1000 == 0:
-                logger.info(f"Progress: {i + 1}/{total} ({book_count} processed, {len(errors)} errors)")
+            m = _TAR_BOOK_RE.search(member.name)
+            if not m:
+                continue
+            book_id = m.group(1)
+            if book_id not in catalog_ids:
+                continue
 
             try:
                 rdf_path = rdf_dir / "cache" / "epub" / book_id / f"pg{book_id}.rdf"
@@ -159,11 +163,7 @@ def full_build(repo_id: str, data_dir: Path, dedup: bool = True) -> None:
 
                 meta = parse_rdf(rdf_path)
 
-                txt_path = txt_dir / "cache" / "epub" / book_id / f"pg{book_id}.txt"
-                if not txt_path.exists():
-                    continue
-
-                raw_bytes = txt_path.read_bytes()
+                raw_bytes = tar.extractfile(member).read()
                 clean_text = strip_gutenberg_headers(raw_bytes)
 
                 if not clean_text.strip():
@@ -183,6 +183,9 @@ def full_build(repo_id: str, data_dir: Path, dedup: bool = True) -> None:
                 errors.append((book_id, str(e)))
                 logger.error(f"Error processing book {book_id}: {e}")
 
+            if book_count % 5000 == 0 and book_count > 0:
+                logger.info(f"Progress: {book_count} books processed")
+
     logger.info(
         f"Processed {book_count} books, "
         f"{chapter_count} chapters, "
@@ -190,10 +193,10 @@ def full_build(repo_id: str, data_dir: Path, dedup: bool = True) -> None:
         f"{len(errors)} errors."
     )
 
-    # Free disk space — extracted texts/RDF are no longer needed
+    # Free disk space before upload
     shutil.rmtree(rdf_dir, ignore_errors=True)
-    shutil.rmtree(txt_dir, ignore_errors=True)
-    logger.info("Deleted extracted files to free disk space")
+    inner_tar.unlink(missing_ok=True)
+    logger.info("Deleted intermediate files to free disk space")
 
     # 5. Upload from JSONL files
     logger.info(f"Uploading to {repo_id}...")
